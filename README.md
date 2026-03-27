@@ -1,23 +1,29 @@
 # kafka-perm-check
 
-A single-binary CLI tool for verifying Kafka ACL permissions across topics, consumer groups, transactional IDs, and Schema Registry subjects — **without mutating any existing data**.
+A single-binary CLI tool for verifying Kafka ACL permissions across topics, consumer groups, transactional IDs, and Schema Registry subjects.
 
-Safe to run repeatedly in any environment.
+---
+
+> **⚠️ topic:WRITE produces a real record**
+>
+> The Kafka protocol has no dry-run produce — the only way to verify WRITE permission is to attempt an actual produce request. `topic:WRITE` produces one small sentinel record that is permanently committed to the topic.
+>
+> **Do not run `topic:WRITE` against production topics.** Use a dedicated canary topic with a short retention period, or skip the check entirely with `--skip-topic` / use `--skip-topic` and rely on `txn:WRITE (aborted)` if your principal has transactional ACLs.
 
 ---
 
 ## What it checks
 
-| Resource | Check | Method | Safe? |
+| Resource | Check | Method | Side effects |
 |---|---|---|---|
-| Topic | `DESCRIBE` | Admin DescribeTopicConfigs | ✅ read-only |
-| Topic | `READ` | Subscribe at end offset, poll once — no commit | ✅ no state change |
-| Topic | `WRITE` | Produce one sentinel record | ✅ one probe message |
-| Consumer Group | `DESCRIBE` | Admin DescribeGroups | ✅ read-only |
-| Consumer Group | `READ` | Join group at latest offset, poll, clean leave | ✅ no offset commit |
-| Consumer Group | `OFFSET_READ` | Admin FetchOffsets — no reset | ✅ read-only |
-| Transactional ID | `WRITE (aborted)` | Begin → produce → AbortTransaction | ✅ nothing committed |
-| Schema Registry | `READ` | GET /subjects/{subject}/versions | ✅ read-only |
+| Topic | `DESCRIBE` | Admin DescribeTopicConfigs | None |
+| Topic | `READ` | Subscribe at end offset, poll once — no commit | None |
+| Topic | `WRITE` | Produce one sentinel record | **Record written permanently** |
+| Consumer Group | `DESCRIBE` | Admin DescribeGroups | None |
+| Consumer Group | `READ` | Join group at latest offset, poll, clean leave | None |
+| Consumer Group | `OFFSET_READ` | Admin FetchOffsets — no reset | None |
+| Transactional ID | `WRITE (aborted)` | Begin → produce → AbortTransaction | None — transaction aborted, no consumer-visible record |
+| Schema Registry | `READ` | GET /subjects/{subject}/versions | None |
 
 Exit code `0` if all checks pass. Exit code `1` if any check is DENIED or ERRORED.
 

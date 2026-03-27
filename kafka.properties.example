@@ -1,0 +1,90 @@
+# kafka-perm-check client properties
+# Copy this file to kafka.properties and fill in your values.
+# Lines starting with # are comments and are ignored.
+# Pass via: --config kafka.properties (default)
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  KAFKA BROKER
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# Comma-separated list of broker host:port pairs
+bootstrap.servers=broker1:9092,broker2:9092
+
+# Security protocol — pick one:
+#   PLAINTEXT      no TLS, no auth
+#   SSL            TLS only
+#   SASL_PLAINTEXT SASL auth, no TLS
+#   SASL_SSL       SASL auth + TLS (most common for production)
+security.protocol=SASL_SSL
+
+# ── Authentication ────────────────────────────────────────────────────────────
+
+# PLAIN
+#sasl.mechanism=PLAIN
+#sasl.username=myuser
+#sasl.password=mypassword
+
+# SCRAM-SHA-256 or SCRAM-SHA-512
+#sasl.mechanism=SCRAM-SHA-256
+#sasl.username=myuser
+#sasl.password=mypassword
+
+# OAuthBearer — client credentials grant
+sasl.mechanism=OAUTHBEARER
+sasl.oauthbearer.token.endpoint.url=https://auth.example.com/oauth/token
+sasl.oauthbearer.client.id=my-client-id
+sasl.oauthbearer.client.secret=my-client-secret
+#sasl.oauthbearer.scope=kafka             # optional, space-separated
+
+# ── TLS ───────────────────────────────────────────────────────────────────────
+
+# Truststore: CA cert(s) for broker certificate verification
+# Accepts JKS or PKCS12. Takes precedence over ssl.ca.location.
+ssl.truststore.location=/path/to/kafka.truststore.jks
+ssl.truststore.password=truststorepass
+
+# mTLS — keystore: client certificate + private key
+# Accepts JKS or PKCS12. Takes precedence over ssl.certificate.location.
+#ssl.keystore.location=/path/to/kafka.keystore.jks
+#ssl.keystore.password=keystorepass
+#ssl.key.password=keypassphrase           # private key entry password (defaults to keystore password if unset)
+
+# PEM alternative — used only when truststore/keystore are not set
+#ssl.ca.location=/path/to/ca.pem
+#ssl.certificate.location=/path/to/client.pem
+#ssl.key.location=/path/to/client.key
+#ssl.key.password=keypassphrase           # passphrase for encrypted PEM private key
+
+# Set to empty string to disable broker hostname verification (not recommended for production)
+#ssl.endpoint.identification.algorithm=
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  SCHEMA REGISTRY
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Subject is passed via --sr-subject CLI flag.
+# Omit schema.registry.url to skip schema registry checks.
+
+schema.registry.url=https://sr.example.com
+
+# ── Authentication ────────────────────────────────────────────────────────────
+
+# Basic auth — takes precedence over OAuthBearer when set
+#schema.registry.basic.auth.user.info=myuser:mypassword
+
+# OAuthBearer — used automatically when sasl.mechanism=OAUTHBEARER and basic auth is not set
+# (reuses sasl.oauthbearer.* credentials above)
+
+# ── TLS ───────────────────────────────────────────────────────────────────────
+
+# Truststore: CA cert(s) for SR certificate verification
+# Accepts JKS or PKCS12.
+#schema.registry.ssl.truststore.location=/path/to/sr.truststore.jks
+#schema.registry.ssl.truststore.password=truststorepass
+
+# mTLS — keystore: client certificate + private key
+# Accepts JKS or PKCS12.
+#schema.registry.ssl.keystore.location=/path/to/sr.keystore.jks
+#schema.registry.ssl.keystore.password=keystorepass
+
+# Set to empty string to disable SR hostname verification (not recommended for production)
+#schema.registry.ssl.endpoint.identification.algorithm=

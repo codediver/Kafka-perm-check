@@ -1,0 +1,17 @@
+# Build output
+kafka-perm-check
+
+# Config with real credentials — copy from kafka.properties.example
+kafka.properties
+
+# Keystores and certificates
+*.jks
+*.p12
+*.pfx
+*.pem
+*.key
+*.crt
+*.cer
+
+# macOS
+.DS_Store

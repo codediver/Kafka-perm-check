@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -43,22 +44,43 @@ type Result struct {
 	Detail string
 }
 
-var results []Result
-
-func record(name string, s status, detail string) {
-	results = append(results, Result{name, s, detail})
-	var icon string
+func icon(s status) string {
 	switch s {
 	case statusOK:
-		icon = "✅"
+		return "✅"
 	case statusDenied:
-		icon = "❌"
+		return "❌"
 	case statusSkipped:
-		icon = "⏭ "
-	case statusError:
-		icon = "⚠️ "
+		return "⏭ "
+	default:
+		return "⚠️ "
 	}
-	fmt.Printf("  %s  %-44s %s\n", icon, name, detail)
+}
+
+// Section buffers the results and output lines for one group of checks
+// so that parallel sections can be flushed in order.
+type Section struct {
+	header  string
+	lines   []string
+	results []Result
+}
+
+func newSection(header string) *Section {
+	return &Section{header: header}
+}
+
+func (s *Section) record(name string, st status, detail string) {
+	s.results = append(s.results, Result{name, st, detail})
+	s.lines = append(s.lines, fmt.Sprintf("  %s  %-44s %s", icon(st), name, detail))
+}
+
+func (s *Section) flush() []Result {
+	fmt.Println(s.header)
+	for _, l := range s.lines {
+		fmt.Println(l)
+	}
+	fmt.Println()
+	return s.results
 }
 
 // ── Auth error classification ─────────────────────────────────────────────────
@@ -135,7 +157,8 @@ type Config struct {
 	SRKeystorePass   string // schema.registry.ssl.keystore.password
 	SRTLSSkipVerify  bool   // schema.registry.ssl.endpoint.identification.algorithm=""
 
-	Timeout time.Duration
+	Timeout     time.Duration
+	PollTimeout time.Duration
 }
 
 // loadProperties parses a Java-style key=value properties file.
@@ -614,10 +637,10 @@ func newClient(cfg Config, extra ...kgo.Opt) (*kgo.Client, error) {
 
 // ── Topic checks ──────────────────────────────────────────────────────────────
 
-func checkTopicDescribe(ctx context.Context, cfg Config, topic string) {
+func checkTopicDescribe(ctx context.Context, cfg Config, topic string, sec *Section) {
 	cl, err := newClient(cfg)
 	if err != nil {
-		record("topic:DESCRIBE", statusError, err.Error())
+		sec.record("topic:DESCRIBE", statusError, err.Error())
 		return
 	}
 	defer cl.Close()
@@ -625,21 +648,21 @@ func checkTopicDescribe(ctx context.Context, cfg Config, topic string) {
 	adm := kadm.NewClient(cl)
 	_, err = adm.DescribeTopicConfigs(ctx, topic)
 	s, d := classify(err, "metadata readable")
-	record("topic:DESCRIBE", s, d)
+	sec.record("topic:DESCRIBE", s, d)
 }
 
-func checkTopicRead(ctx context.Context, cfg Config, topic string) {
+func checkTopicRead(ctx context.Context, cfg Config, topic string, sec *Section) {
 	cl, err := newClient(cfg,
 		kgo.ConsumeTopics(topic),
 		kgo.ConsumeResetOffset(kgo.NewOffset().AtEnd()),
 	)
 	if err != nil {
-		record("topic:READ", statusError, err.Error())
+		sec.record("topic:READ", statusError, err.Error())
 		return
 	}
 	defer cl.Close()
 
-	pollCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	pollCtx, cancel := context.WithTimeout(ctx, cfg.PollTimeout)
 	defer cancel()
 
 	fetches := cl.PollRecords(pollCtx, 1)
@@ -647,24 +670,24 @@ func checkTopicRead(ctx context.Context, cfg Config, topic string) {
 		for _, fe := range errs {
 			if strings.Contains(fe.Err.Error(), "context deadline exceeded") ||
 				strings.Contains(fe.Err.Error(), "context canceled") {
-				record("topic:READ", statusOK, "fetch issued successfully (no new records in poll window)")
+				sec.record("topic:READ", statusOK, "fetch issued successfully (no new records in poll window)")
 				return
 			}
 		}
 		s, d := classify(errs[0].Err, "")
-		record("topic:READ", s, d)
+		sec.record("topic:READ", s, d)
 		return
 	}
-	record("topic:READ", statusOK, "poll succeeded (no commit)")
+	sec.record("topic:READ", statusOK, "poll succeeded (no commit)")
 }
 
-func checkTopicWrite(ctx context.Context, cfg Config, topic string) {
+func checkTopicWrite(ctx context.Context, cfg Config, topic string, sec *Section) {
 	cl, err := newClient(cfg,
 		kgo.RequiredAcks(kgo.AllISRAcks()),
 		kgo.DefaultProduceTopic(topic),
 	)
 	if err != nil {
-		record("topic:WRITE", statusError, err.Error())
+		sec.record("topic:WRITE", statusError, err.Error())
 		return
 	}
 	defer cl.Close()
@@ -680,18 +703,18 @@ func checkTopicWrite(ctx context.Context, cfg Config, topic string) {
 	select {
 	case err := <-ackCh:
 		s, d := classify(err, "message delivered")
-		record("topic:WRITE", s, d)
+		sec.record("topic:WRITE", s, d)
 	case <-time.After(cfg.Timeout):
-		record("topic:WRITE", statusError, "timeout waiting for ack")
+		sec.record("topic:WRITE", statusError, "timeout waiting for ack")
 	}
 }
 
 // ── Consumer group checks ─────────────────────────────────────────────────────
 
-func checkGroupDescribe(ctx context.Context, cfg Config, group string) {
+func checkGroupDescribe(ctx context.Context, cfg Config, group string, sec *Section) {
 	cl, err := newClient(cfg)
 	if err != nil {
-		record("group:DESCRIBE", statusError, err.Error())
+		sec.record("group:DESCRIBE", statusError, err.Error())
 		return
 	}
 	defer cl.Close()
@@ -700,18 +723,18 @@ func checkGroupDescribe(ctx context.Context, cfg Config, group string) {
 	described, err := adm.DescribeGroups(ctx, group)
 	if err != nil {
 		s, d := classify(err, "")
-		record("group:DESCRIBE", s, d)
+		sec.record("group:DESCRIBE", s, d)
 		return
 	}
 	if g, ok := described[group]; ok && g.Err != nil {
 		s, d := classify(g.Err, "")
-		record("group:DESCRIBE", s, d)
+		sec.record("group:DESCRIBE", s, d)
 		return
 	}
-	record("group:DESCRIBE", statusOK, "group metadata readable")
+	sec.record("group:DESCRIBE", statusOK, "group metadata readable")
 }
 
-func checkGroupRead(ctx context.Context, cfg Config, group, topic string) {
+func checkGroupRead(ctx context.Context, cfg Config, group, topic string, sec *Section) {
 	cl, err := newClient(cfg,
 		kgo.ConsumerGroup(group),
 		kgo.ConsumeTopics(topic),
@@ -719,12 +742,12 @@ func checkGroupRead(ctx context.Context, cfg Config, group, topic string) {
 		kgo.DisableAutoCommit(),
 	)
 	if err != nil {
-		record("group:READ", statusError, err.Error())
+		sec.record("group:READ", statusError, err.Error())
 		return
 	}
 	defer cl.Close()
 
-	pollCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	pollCtx, cancel := context.WithTimeout(ctx, cfg.PollTimeout)
 	defer cancel()
 
 	fetches := cl.PollRecords(pollCtx, 1)
@@ -734,21 +757,21 @@ func checkGroupRead(ctx context.Context, cfg Config, group, topic string) {
 			// messages arrived — auth is already proven by the join completing.
 			if strings.Contains(fe.Err.Error(), "context deadline exceeded") ||
 				strings.Contains(fe.Err.Error(), "context canceled") {
-				record("group:READ", statusOK, "joined group successfully (no new records in poll window)")
+				sec.record("group:READ", statusOK, "joined group successfully (no new records in poll window)")
 				return
 			}
 		}
 		s, d := classify(errs[0].Err, "")
-		record("group:READ", s, d)
+		sec.record("group:READ", s, d)
 		return
 	}
-	record("group:READ", statusOK, "joined group, polled (no offset commit)")
+	sec.record("group:READ", statusOK, "joined group, polled (no offset commit)")
 }
 
-func checkGroupOffsetRead(ctx context.Context, cfg Config, group, topic string) {
+func checkGroupOffsetRead(ctx context.Context, cfg Config, group, topic string, sec *Section) {
 	cl, err := newClient(cfg)
 	if err != nil {
-		record("group:OFFSET_READ (dry)", statusError, err.Error())
+		sec.record("group:OFFSET_READ (dry)", statusError, err.Error())
 		return
 	}
 	defer cl.Close()
@@ -756,26 +779,26 @@ func checkGroupOffsetRead(ctx context.Context, cfg Config, group, topic string) 
 	adm := kadm.NewClient(cl)
 	_, err = adm.FetchOffsetsForTopics(ctx, group, topic)
 	s, d := classify(err, "committed offsets readable")
-	record("group:OFFSET_READ (dry)", s, d)
+	sec.record("group:OFFSET_READ (dry)", s, d)
 }
 
 // ── Transactional ID check ────────────────────────────────────────────────────
 
-func checkTransactionWriteAbort(ctx context.Context, cfg Config, txnID, topic string) {
+func checkTransactionWriteAbort(ctx context.Context, cfg Config, txnID, topic string, sec *Section) {
 	cl, err := newClient(cfg,
 		kgo.TransactionalID(txnID),
 		kgo.RequiredAcks(kgo.AllISRAcks()),
 		kgo.DefaultProduceTopic(topic),
 	)
 	if err != nil {
-		record("txn:WRITE (aborted)", statusError, err.Error())
+		sec.record("txn:WRITE (aborted)", statusError, err.Error())
 		return
 	}
 	defer cl.Close()
 
 	if err := cl.BeginTransaction(); err != nil {
 		s, d := classify(err, "")
-		record("txn:WRITE (aborted)", s, d)
+		sec.record("txn:WRITE (aborted)", s, d)
 		return
 	}
 
@@ -792,32 +815,32 @@ func checkTransactionWriteAbort(ctx context.Context, cfg Config, txnID, topic st
 		if err != nil {
 			_ = cl.AbortBufferedRecords(ctx)
 			s, d := classify(err, "")
-			record("txn:WRITE (aborted)", s, d)
+			sec.record("txn:WRITE (aborted)", s, d)
 			return
 		}
 	case <-time.After(cfg.Timeout):
 		_ = cl.AbortBufferedRecords(ctx)
-		record("txn:WRITE (aborted)", statusError, "timeout waiting for produce ack")
+		sec.record("txn:WRITE (aborted)", statusError, "timeout waiting for produce ack")
 		return
 	}
 
 	if err := cl.EndTransaction(ctx, kgo.TryAbort); err != nil {
 		s, d := classify(err, "")
-		record("txn:WRITE (aborted)", s, fmt.Sprintf("produced OK but abort failed: %s", d))
+		sec.record("txn:WRITE (aborted)", s, fmt.Sprintf("produced OK but abort failed: %s", d))
 		return
 	}
 
-	record("txn:WRITE (aborted)", statusOK, "transaction initiated and aborted (no data committed)")
+	sec.record("txn:WRITE (aborted)", statusOK, "transaction initiated and aborted (no data committed)")
 }
 
 // ── Schema Registry check ─────────────────────────────────────────────────────
 
-func checkSchemaRead(ctx context.Context, cfg Config, subject string) {
+func checkSchemaRead(ctx context.Context, cfg Config, subject string, sec *Section) {
 	reqURL := fmt.Sprintf("%s/subjects/%s/versions", cfg.SRUrl, subject)
 
 	tlsCfg, err := buildSRTLSConfig(cfg)
 	if err != nil {
-		record("schema:READ", statusError, fmt.Sprintf("building SR TLS config: %s", err))
+		sec.record("schema:READ", statusError, fmt.Sprintf("building SR TLS config: %s", err))
 		return
 	}
 
@@ -832,7 +855,7 @@ func checkSchemaRead(ctx context.Context, cfg Config, subject string) {
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
-		record("schema:READ", statusError, err.Error())
+		sec.record("schema:READ", statusError, err.Error())
 		return
 	}
 	req.Header.Set("Accept", "application/vnd.schemaregistry.v1+json")
@@ -844,7 +867,7 @@ func checkSchemaRead(ctx context.Context, cfg Config, subject string) {
 	case strings.ToLower(cfg.SASLMechanism) == "oauthbearer":
 		token, err := fetchClientCredentialsToken(ctx, cfg)
 		if err != nil {
-			record("schema:READ", statusError, fmt.Sprintf("fetching OAuth token: %s", err))
+			sec.record("schema:READ", statusError, fmt.Sprintf("fetching OAuth token: %s", err))
 			return
 		}
 		req.Header.Set("Authorization", "Bearer "+token.Token)
@@ -852,20 +875,20 @@ func checkSchemaRead(ctx context.Context, cfg Config, subject string) {
 
 	resp, err := httpCl.Do(req)
 	if err != nil {
-		record("schema:READ", statusError, err.Error())
+		sec.record("schema:READ", statusError, err.Error())
 		return
 	}
 	defer resp.Body.Close()
 
 	switch resp.StatusCode {
 	case http.StatusOK:
-		record("schema:READ", statusOK, "versions listed")
+		sec.record("schema:READ", statusOK, "versions listed")
 	case http.StatusNotFound:
-		record("schema:READ", statusOK, "HTTP 404 — subject not found, but READ permitted")
+		sec.record("schema:READ", statusOK, "HTTP 404 — subject not found, but READ permitted")
 	case http.StatusUnauthorized, http.StatusForbidden:
-		record("schema:READ", statusDenied, fmt.Sprintf("HTTP %d", resp.StatusCode))
+		sec.record("schema:READ", statusDenied, fmt.Sprintf("HTTP %d", resp.StatusCode))
 	default:
-		record("schema:READ", statusError, fmt.Sprintf("unexpected HTTP %d", resp.StatusCode))
+		sec.record("schema:READ", statusError, fmt.Sprintf("unexpected HTTP %d", resp.StatusCode))
 	}
 }
 
@@ -878,8 +901,9 @@ func main() {
 		group       string
 		txnID       string
 		srSubject   string
-		timeoutSecs int
-		skipTopic   bool
+		timeoutSecs     int
+		pollTimeoutSecs int
+		skipTopic       bool
 		skipGroup   bool
 		skipTxn     bool
 		skipSchema  bool
@@ -909,6 +933,7 @@ Exits 0 if all checks pass, 1 if any check is DENIED or ERRORED.`,
 			if err != nil {
 				return fmt.Errorf("invalid config: %w", err)
 			}
+			cfg.PollTimeout = time.Duration(pollTimeoutSecs) * time.Second
 
 			// All inputs are valid — suppress usage for check failures.
 			cmd.SilenceUsage = true
@@ -952,62 +977,102 @@ Exits 0 if all checks pass, 1 if any check is DENIED or ERRORED.`,
 			fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 			fmt.Println()
 
-			// ── Topic ──
-			if !skipTopic {
+			// Run the four check groups in parallel; each buffers its own output
+			// so sections are always printed in order after all complete.
+			type sectionResult struct {
+				sec     *Section
+				skipped string // non-empty means the section was skipped
+			}
+
+			runs := make([]sectionResult, 4)
+			var wg sync.WaitGroup
+
+			wg.Add(4)
+
+			go func() {
+				defer wg.Done()
+				if skipTopic {
+					return
+				}
 				if topic == "" {
-					fmt.Println("  ⚠️  --topic not set, skipping topic checks")
-				} else {
-					fmt.Printf("── Topic: %s\n", topic)
-					checkTopicDescribe(ctx, cfg, topic)
-					checkTopicRead(ctx, cfg, topic)
-					checkTopicWrite(ctx, cfg, topic)
-					fmt.Println()
+					runs[0] = sectionResult{skipped: "  ⚠️  --topic not set, skipping topic checks"}
+					return
 				}
-			}
+				sec := newSection(fmt.Sprintf("── Topic: %s", topic))
+				checkTopicDescribe(ctx, cfg, topic, sec)
+				checkTopicRead(ctx, cfg, topic, sec)
+				checkTopicWrite(ctx, cfg, topic, sec)
+				runs[0] = sectionResult{sec: sec}
+			}()
 
-			// ── Consumer Group ──
-			if !skipGroup {
+			go func() {
+				defer wg.Done()
+				if skipGroup {
+					return
+				}
 				if group == "" {
-					fmt.Println("  ⚠️  --group not set, skipping consumer group checks")
-				} else if topic == "" {
-					fmt.Println("  ⚠️  --topic required for group checks, skipping")
-				} else {
-					fmt.Printf("── Consumer Group: %s\n", group)
-					checkGroupDescribe(ctx, cfg, group)
-					checkGroupRead(ctx, cfg, group, topic)
-					checkGroupOffsetRead(ctx, cfg, group, topic)
-					fmt.Println()
+					runs[1] = sectionResult{skipped: "  ⚠️  --group not set, skipping consumer group checks"}
+					return
 				}
-			}
+				if topic == "" {
+					runs[1] = sectionResult{skipped: "  ⚠️  --topic required for group checks, skipping"}
+					return
+				}
+				sec := newSection(fmt.Sprintf("── Consumer Group: %s", group))
+				checkGroupDescribe(ctx, cfg, group, sec)
+				checkGroupRead(ctx, cfg, group, topic, sec)
+				checkGroupOffsetRead(ctx, cfg, group, topic, sec)
+				runs[1] = sectionResult{sec: sec}
+			}()
 
-			// ── Transactional ID ──
-			if !skipTxn {
+			go func() {
+				defer wg.Done()
+				if skipTxn {
+					return
+				}
 				if txnID == "" {
-					fmt.Println("  ⚠️  --txn-id not set, skipping transactional checks")
-				} else if topic == "" {
-					fmt.Println("  ⚠️  --topic required for txn checks, skipping")
-				} else {
-					fmt.Printf("── Transactional ID: %s\n", txnID)
-					checkTransactionWriteAbort(ctx, cfg, txnID, topic)
-					fmt.Println()
+					runs[2] = sectionResult{skipped: "  ⚠️  --txn-id not set, skipping transactional checks"}
+					return
 				}
-			}
+				if topic == "" {
+					runs[2] = sectionResult{skipped: "  ⚠️  --topic required for txn checks, skipping"}
+					return
+				}
+				sec := newSection(fmt.Sprintf("── Transactional ID: %s", txnID))
+				checkTransactionWriteAbort(ctx, cfg, txnID, topic, sec)
+				runs[2] = sectionResult{sec: sec}
+			}()
 
-			// ── Schema Registry ──
-			if !skipSchema {
+			go func() {
+				defer wg.Done()
+				if skipSchema {
+					return
+				}
 				if cfg.SRUrl == "" || srSubject == "" {
-					fmt.Println("  ⚠️  schema.registry.url (properties) and --sr-subject required, skipping schema checks")
-				} else {
-					fmt.Printf("── Schema Registry Subject: %s\n", srSubject)
-					checkSchemaRead(ctx, cfg, srSubject)
-					fmt.Println()
+					runs[3] = sectionResult{skipped: "  ⚠️  schema.registry.url (properties) and --sr-subject required, skipping schema checks"}
+					return
+				}
+				sec := newSection(fmt.Sprintf("── Schema Registry Subject: %s", srSubject))
+				checkSchemaRead(ctx, cfg, srSubject, sec)
+				runs[3] = sectionResult{sec: sec}
+			}()
+
+			wg.Wait()
+
+			// Flush sections in order and collect all results.
+			var allResults []Result
+			for _, r := range runs {
+				if r.skipped != "" {
+					fmt.Println(r.skipped)
+				} else if r.sec != nil {
+					allResults = append(allResults, r.sec.flush()...)
 				}
 			}
 
 			// ── Summary ──
 			fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 			var ok, denied, skipped, errored int
-			for _, r := range results {
+			for _, r := range allResults {
 				switch r.Status {
 				case statusOK:
 					ok++
@@ -1035,6 +1100,7 @@ Exits 0 if all checks pass, 1 if any check is DENIED or ERRORED.`,
 	f.StringVar(&configFile, "config", "kafka.properties",
 		"Path to Kafka client properties file")
 	f.IntVar(&timeoutSecs, "timeout", 10, "Per-operation timeout in seconds")
+	f.IntVar(&pollTimeoutSecs, "poll-timeout", 2, "Timeout in seconds for consumer poll checks (topic:READ, group:READ)")
 
 	// Resources to test
 	f.StringVar(&topic, "topic", "", "Topic to test (DESCRIBE, READ, WRITE)")

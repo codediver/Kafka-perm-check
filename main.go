@@ -127,10 +127,12 @@ type Config struct {
 	SASLPass      string
 
 	// OAuthBearer
-	OAuthTokenEndpoint string
-	OAuthClientID      string
-	OAuthClientSecret  string
-	OAuthScope         string
+	OAuthTokenEndpoint  string
+	OAuthClientID       string
+	OAuthClientSecret   string
+	OAuthScope          string
+	OAuthLogicalCluster string // SASL extension: logicalCluster (Confluent Cloud)
+	OAuthIdentityPoolId string // SASL extension: identityPoolId (Confluent Cloud)
 
 	// TLS / mTLS
 	TLS           bool
@@ -198,6 +200,8 @@ func loadProperties(path string) (map[string]string, error) {
 //	sasl.oauthbearer.client.id           — OAuth2 client ID
 //	sasl.oauthbearer.client.secret       — OAuth2 client secret
 //	sasl.oauthbearer.scope               — OAuth2 scope (optional)
+//	sasl.oauthbearer.extensions.logicalCluster  — SASL extension for Confluent Cloud logical cluster
+//	sasl.oauthbearer.extensions.identityPoolId  — SASL extension for Confluent Cloud identity pool
 //	ssl.truststore.location    — JKS or PKCS12 truststore (CA certs); takes precedence over ssl.ca.location
 //	ssl.truststore.password    — truststore passphrase
 //	ssl.keystore.location      — JKS or PKCS12 keystore (client cert+key for mTLS); takes precedence over ssl.certificate.location
@@ -252,6 +256,8 @@ func configFromProperties(props map[string]string, timeout time.Duration) (Confi
 		cfg.OAuthClientID = props["sasl.oauthbearer.client.id"]
 		cfg.OAuthClientSecret = props["sasl.oauthbearer.client.secret"]
 		cfg.OAuthScope = props["sasl.oauthbearer.scope"]
+		cfg.OAuthLogicalCluster = props["sasl.oauthbearer.extensions.logicalCluster"]
+		cfg.OAuthIdentityPoolId = props["sasl.oauthbearer.extensions.identityPoolId"]
 		if cfg.OAuthTokenEndpoint == "" {
 			return cfg, fmt.Errorf("sasl.oauthbearer.token.endpoint.url is required for OAUTHBEARER")
 		}
@@ -586,7 +592,17 @@ func fetchClientCredentialsToken(ctx context.Context, cfg Config) (oauth.Auth, e
 		return oauth.Auth{}, fmt.Errorf("empty access_token in token response")
 	}
 
-	return oauth.Auth{Token: tokenResp.AccessToken}, nil
+	auth := oauth.Auth{Token: tokenResp.AccessToken}
+	if cfg.OAuthLogicalCluster != "" || cfg.OAuthIdentityPoolId != "" {
+		auth.Extensions = make(map[string]string)
+		if cfg.OAuthLogicalCluster != "" {
+			auth.Extensions["logicalCluster"] = cfg.OAuthLogicalCluster
+		}
+		if cfg.OAuthIdentityPoolId != "" {
+			auth.Extensions["identityPoolId"] = cfg.OAuthIdentityPoolId
+		}
+	}
+	return auth, nil
 }
 
 // ── Client factory ────────────────────────────────────────────────────────────

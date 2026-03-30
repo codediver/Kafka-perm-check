@@ -36,6 +36,10 @@ sasl.oauthbearer.client.id=my-client-id
 sasl.oauthbearer.client.secret=my-client-secret
 #sasl.oauthbearer.scope=kafka             # optional, space-separated
 
+# Confluent Cloud SASL extensions (optional)
+#sasl.oauthbearer.extensions.logicalCluster=lkc-xxxxx
+#sasl.oauthbearer.extensions.identityPoolId=pool-xxxxx
+
 # ── TLS ───────────────────────────────────────────────────────────────────────
 
 # Truststore: CA cert(s) for broker certificate verification

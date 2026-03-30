@@ -80,6 +80,8 @@ sasl.oauthbearer.token.endpoint.url=https://auth.example.com/oauth/token
 sasl.oauthbearer.client.id=my-client-id
 sasl.oauthbearer.client.secret=my-client-secret
 sasl.oauthbearer.scope=kafka   # optional
+sasl.oauthbearer.extensions.logicalCluster=lkc-xxxxx    # optional, Confluent Cloud
+sasl.oauthbearer.extensions.identityPoolId=pool-xxxxx   # optional, Confluent Cloud
 ```
 
 ### Kafka TLS

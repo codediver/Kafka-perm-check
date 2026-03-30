@@ -132,13 +132,23 @@ schema.registry.ssl.keystore.password=keystorepass
 
 ### Schema Registry auth
 
-Basic auth takes precedence. If unset and `sasl.mechanism=OAUTHBEARER`, a Bearer token is fetched automatically using the same OAuth credentials as Kafka.
+Auth priority: basic auth > SR bearer auth > inherit Kafka OAUTHBEARER.
 
 ```properties
-# Basic auth
+# Basic auth (highest priority)
 schema.registry.basic.auth.user.info=myuser:mypassword
 
-# OAuthBearer — automatic when sasl.mechanism=OAUTHBEARER and basic auth is unset
+# Bearer auth — SR-specific OAuth/OIDC
+# Falls back to sasl.oauthbearer.* if issuer/client settings are omitted.
+bearer.auth.credentials.source=OAUTHBEARER            # OAUTHBEARER (default) or STATIC_TOKEN
+bearer.auth.issuer.endpoint.url=https://auth.example.com/oauth/token
+bearer.auth.client.id=sr-client-id
+bearer.auth.client.secret=sr-client-secret
+bearer.auth.scope=schema-registry                      # optional
+bearer.auth.logical.cluster=lsrc-xxxxx                 # optional, Confluent Cloud
+bearer.auth.identity.pool.id=pool-xxxxx                # optional, Confluent Cloud
+
+# OAuthBearer — automatic when sasl.mechanism=OAUTHBEARER and no basic/bearer auth is set
 ```
 
 ---

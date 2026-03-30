@@ -152,6 +152,15 @@ type Config struct {
 	SRUrl           string // schema.registry.url
 	SRBasicAuthUser string // schema.registry.basic.auth.user.info (user part)
 	SRBasicAuthPass string // schema.registry.basic.auth.user.info (password part)
+	// SR Bearer / OAuth
+	SRBearerAuthSource         string // bearer.auth.credentials.source (OAUTHBEARER = default)
+	SRBearerAuthToken          string // bearer.auth.token (static token)
+	SRBearerAuthIssuerURL      string // bearer.auth.issuer.endpoint.url
+	SRBearerAuthClientID       string // bearer.auth.client.id
+	SRBearerAuthClientSecret   string // bearer.auth.client.secret
+	SRBearerAuthScope          string // bearer.auth.scope
+	SRBearerAuthLogicalCluster string // bearer.auth.logical.cluster
+	SRBearerAuthIdentityPoolId string // bearer.auth.identity.pool.id
 	// SR TLS — PKCS12 truststore/keystore (independent from Kafka TLS)
 	SRTruststorePath string // schema.registry.ssl.truststore.location
 	SRTruststorePass string // schema.registry.ssl.truststore.password
@@ -217,6 +226,14 @@ func loadProperties(path string) (map[string]string, error) {
 //	schema.registry.ssl.truststore.password          — truststore passphrase
 //	schema.registry.ssl.keystore.location            — PKCS12 keystore (client cert+key for mTLS)
 //	schema.registry.ssl.keystore.password            — keystore passphrase
+//	bearer.auth.credentials.source                       — how to obtain SR bearer token: OAUTHBEARER (default) or STATIC_TOKEN
+//	bearer.auth.token                                    — static bearer token (when credentials.source=STATIC_TOKEN)
+//	bearer.auth.issuer.endpoint.url                      — OAuth/OIDC issuer endpoint for SR bearer auth
+//	bearer.auth.client.id                                — OAuth client ID for SR bearer auth
+//	bearer.auth.client.secret                            — OAuth client secret for SR bearer auth
+//	bearer.auth.scope                                    — OAuth scope for SR bearer auth (optional)
+//	bearer.auth.logical.cluster                          — logical cluster ID header for SR (optional, Confluent Cloud)
+//	bearer.auth.identity.pool.id                         — identity pool ID header for SR (optional, Confluent Cloud)
 //	schema.registry.ssl.endpoint.identification.algorithm — set to empty string to disable hostname verification
 func configFromProperties(props map[string]string, timeout time.Duration) (Config, error) {
 	cfg := Config{Timeout: timeout}
@@ -291,6 +308,15 @@ func configFromProperties(props map[string]string, timeout time.Duration) (Confi
 		cfg.SRBasicAuthUser = user
 		cfg.SRBasicAuthPass = pass
 	}
+
+	cfg.SRBearerAuthSource = props["bearer.auth.credentials.source"]
+	cfg.SRBearerAuthToken = props["bearer.auth.token"]
+	cfg.SRBearerAuthIssuerURL = props["bearer.auth.issuer.endpoint.url"]
+	cfg.SRBearerAuthClientID = props["bearer.auth.client.id"]
+	cfg.SRBearerAuthClientSecret = props["bearer.auth.client.secret"]
+	cfg.SRBearerAuthScope = props["bearer.auth.scope"]
+	cfg.SRBearerAuthLogicalCluster = props["bearer.auth.logical.cluster"]
+	cfg.SRBearerAuthIdentityPoolId = props["bearer.auth.identity.pool.id"]
 
 	cfg.SRTruststorePath = props["schema.registry.ssl.truststore.location"]
 	cfg.SRTruststorePass = props["schema.registry.ssl.truststore.password"]
@@ -605,6 +631,92 @@ func fetchClientCredentialsToken(ctx context.Context, cfg Config) (oauth.Auth, e
 	return auth, nil
 }
 
+// fetchSRBearerToken obtains a bearer token for Schema Registry authentication.
+// It supports two modes via bearer.auth.credentials.source:
+//   - STATIC_TOKEN: returns bearer.auth.token as-is
+//   - OAUTHBEARER (default): performs a client_credentials grant against
+//     bearer.auth.issuer.endpoint.url (or falls back to Kafka's OAUTHBEARER config)
+func fetchSRBearerToken(ctx context.Context, cfg Config) (string, error) {
+	source := strings.ToUpper(strings.TrimSpace(cfg.SRBearerAuthSource))
+
+	if source == "STATIC_TOKEN" {
+		if cfg.SRBearerAuthToken == "" {
+			return "", fmt.Errorf("bearer.auth.token is required when bearer.auth.credentials.source=STATIC_TOKEN")
+		}
+		return cfg.SRBearerAuthToken, nil
+	}
+
+	// OAUTHBEARER (default): use SR-specific bearer.auth.* settings if present,
+	// otherwise fall back to the Kafka sasl.oauthbearer.* settings.
+	endpoint := cfg.SRBearerAuthIssuerURL
+	clientID := cfg.SRBearerAuthClientID
+	clientSecret := cfg.SRBearerAuthClientSecret
+	scope := cfg.SRBearerAuthScope
+
+	if endpoint == "" {
+		endpoint = cfg.OAuthTokenEndpoint
+	}
+	if clientID == "" {
+		clientID = cfg.OAuthClientID
+	}
+	if clientSecret == "" {
+		clientSecret = cfg.OAuthClientSecret
+	}
+	if scope == "" {
+		scope = cfg.OAuthScope
+	}
+
+	if endpoint == "" {
+		return "", fmt.Errorf("bearer.auth.issuer.endpoint.url (or sasl.oauthbearer.token.endpoint.url) is required for SR bearer auth")
+	}
+	if clientID == "" || clientSecret == "" {
+		return "", fmt.Errorf("bearer.auth.client.id and bearer.auth.client.secret (or sasl.oauthbearer equivalents) are required for SR bearer auth")
+	}
+
+	form := url.Values{
+		"grant_type":    {"client_credentials"},
+		"client_id":     {clientID},
+		"client_secret": {clientSecret},
+	}
+	if scope != "" {
+		form.Set("scope", scope)
+	}
+
+	httpCl := &http.Client{Timeout: cfg.Timeout}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint,
+		strings.NewReader(form.Encode()))
+	if err != nil {
+		return "", fmt.Errorf("building SR token request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := httpCl.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("SR token request to %q failed: %w", endpoint, err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("reading SR token response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("SR token endpoint returned HTTP %d: %s", resp.StatusCode, body)
+	}
+
+	var tokenResp struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.Unmarshal(body, &tokenResp); err != nil {
+		return "", fmt.Errorf("parsing SR token response: %w", err)
+	}
+	if tokenResp.AccessToken == "" {
+		return "", fmt.Errorf("empty access_token in SR token response")
+	}
+
+	return tokenResp.AccessToken, nil
+}
+
 // ── Client factory ────────────────────────────────────────────────────────────
 
 func newClient(cfg Config, extra ...kgo.Opt) (*kgo.Client, error) {
@@ -876,10 +988,26 @@ func checkSchemaRead(ctx context.Context, cfg Config, subject string, sec *Secti
 	}
 	req.Header.Set("Accept", "application/vnd.schemaregistry.v1+json")
 
-	// SR auth: basic auth takes precedence; fall back to OAuth Bearer if configured.
+	// SR auth priority:
+	//  1. Basic auth (schema.registry.basic.auth.user.info)
+	//  2. Bearer auth (bearer.auth.credentials.source / bearer.auth.*)
+	//  3. Inherit Kafka OAUTHBEARER as fallback
 	switch {
 	case cfg.SRBasicAuthUser != "":
 		req.SetBasicAuth(cfg.SRBasicAuthUser, cfg.SRBasicAuthPass)
+	case cfg.SRBearerAuthSource != "" || cfg.SRBearerAuthIssuerURL != "" || cfg.SRBearerAuthToken != "":
+		token, err := fetchSRBearerToken(ctx, cfg)
+		if err != nil {
+			sec.record("schema:READ", statusError, fmt.Sprintf("fetching SR bearer token: %s", err))
+			return
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		if cfg.SRBearerAuthLogicalCluster != "" {
+			req.Header.Set("target-sr-cluster", cfg.SRBearerAuthLogicalCluster)
+		}
+		if cfg.SRBearerAuthIdentityPoolId != "" {
+			req.Header.Set("Confluent-Identity-Pool-Id", cfg.SRBearerAuthIdentityPoolId)
+		}
 	case strings.ToLower(cfg.SASLMechanism) == "oauthbearer":
 		token, err := fetchClientCredentialsToken(ctx, cfg)
 		if err != nil {

@@ -78,6 +78,17 @@ schema.registry.url=https://sr.example.com
 # OAuthBearer — used automatically when sasl.mechanism=OAUTHBEARER and basic auth is not set
 # (reuses sasl.oauthbearer.* credentials above)
 
+# Bearer auth — SR-specific OAuth/OIDC (overrides Kafka OAUTHBEARER settings for SR)
+# If issuer/client settings are omitted, falls back to sasl.oauthbearer.* above.
+#bearer.auth.credentials.source=OAUTHBEARER          # OAUTHBEARER (default) or STATIC_TOKEN
+#bearer.auth.issuer.endpoint.url=https://auth.example.com/oauth/token
+#bearer.auth.client.id=sr-client-id
+#bearer.auth.client.secret=sr-client-secret
+#bearer.auth.scope=schema-registry                    # optional
+#bearer.auth.logical.cluster=lsrc-xxxxx               # optional, Confluent Cloud
+#bearer.auth.identity.pool.id=pool-xxxxx              # optional, Confluent Cloud
+#bearer.auth.token=my-static-token                    # only for STATIC_TOKEN mode
+
 # ── TLS ───────────────────────────────────────────────────────────────────────
 
 # Truststore: CA cert(s) for SR certificate verification
